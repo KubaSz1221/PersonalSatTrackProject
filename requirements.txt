@@ -1,0 +1,7 @@
+streamlit>=1.50
+streamlit-folium>=0.24
+folium>=0.18
+skyfield>=1.49
+pandas>=2.2
+plotly>=5.24
+requests>=2.32
