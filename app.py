@@ -392,9 +392,12 @@ def predict_passes(
             passes.append(
                 {
                     "AOS (UTC)": rise.utc_datetime().strftime("%b %d, %H:%M:%S"),
-                    "Peak (UTC)": culmination.utc_datetime().strftime("%H:%M:%S")
+                    "Peak (UTC)": culmination.utc_datetime().strftime("%b %d, %H:%M:%S")
                     if culmination is not None
                     else "—",
+                    "Peak datetime": culmination.utc_datetime()
+                    if culmination is not None
+                    else None,
                     "LOS (UTC)": time.utc_datetime().strftime("%H:%M:%S"),
                     "Peak elevation": f"{(satellite - observer).at(culmination).altaz()[0].degrees:.1f}°"
                     if culmination is not None
@@ -403,6 +406,69 @@ def predict_passes(
             )
             rise, culmination = None, None
     return pd.DataFrame(passes)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_hourly_weather(latitude: float, longitude: float) -> pd.DataFrame:
+    import requests
+
+    response = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": latitude,
+            "longitude": longitude,
+            "hourly": "cloud_cover,precipitation_probability,precipitation,temperature_2m,wind_speed_10m",
+            "forecast_days": 3,
+            "timezone": "UTC",
+        },
+        timeout=60,
+        headers={"User-Agent": "OrbitDesk/1.0"},
+    )
+    response.raise_for_status()
+    hourly = response.json().get("hourly", {})
+    if not hourly.get("time"):
+        raise ValueError("The weather provider returned no hourly forecast.")
+    return pd.DataFrame(
+        {
+            "Time": pd.to_datetime(hourly["time"], utc=True),
+            "Cloud cover": hourly["cloud_cover"],
+            "Precipitation probability": hourly["precipitation_probability"],
+            "Precipitation": hourly["precipitation"],
+            "Temperature": hourly["temperature_2m"],
+            "Wind speed": hourly["wind_speed_10m"],
+        }
+    )
+
+
+def add_weather_to_passes(passes: pd.DataFrame, forecast: pd.DataFrame) -> pd.DataFrame:
+    result = passes.copy()
+    weather_columns = [
+        "Forecast hour (UTC)",
+        "Cloud cover",
+        "Precip. chance",
+        "Precipitation",
+        "Temperature",
+        "Wind",
+    ]
+    for column in weather_columns:
+        result[column] = "Unavailable"
+
+    for index, pass_row in result.iterrows():
+        peak = pass_row["Peak datetime"]
+        if peak is None:
+            continue
+        time_differences = (forecast["Time"] - pd.Timestamp(peak)).abs()
+        closest_index = time_differences.idxmin()
+        if time_differences.loc[closest_index] > pd.Timedelta(minutes=90):
+            continue
+        weather = forecast.loc[closest_index]
+        result.loc[index, "Forecast hour (UTC)"] = weather["Time"].strftime("%b %d, %H:%M")
+        result.loc[index, "Cloud cover"] = f"{weather['Cloud cover']:.0f}%"
+        result.loc[index, "Precip. chance"] = f"{weather['Precipitation probability']:.0f}%"
+        result.loc[index, "Precipitation"] = f"{weather['Precipitation']:.1f} mm"
+        result.loc[index, "Temperature"] = f"{weather['Temperature']:.1f}°C"
+        result.loc[index, "Wind"] = f"{weather['Wind speed']:.1f} km/h"
+    return result.drop(columns=["Peak datetime"])
 
 
 def record_element_changes(records: list[dict]) -> list[dict]:
@@ -483,18 +549,27 @@ with st.sidebar:
     if lookup_submitted:
         try:
             entered_id = int(norad_input.strip())
-            if not 1 <= entered_id <= 339999:
-                raise ValueError
-            st.session_state.norad_id = entered_id
-            if entered_id not in st.session_state.available_norad_ids:
-                st.session_state.available_norad_ids.append(entered_id)
-            if entered_id not in st.session_state.globe_norad_ids:
-                if len(st.session_state.globe_norad_ids) >= 8:
-                    lookup_error = "Remove a satellite from the globe before adding another (maximum 8)."
-                else:
-                    st.session_state.globe_norad_ids.append(entered_id)
         except ValueError:
             lookup_error = "Enter a NORAD ID between 1 and 339999."
+        else:
+            if not 1 <= entered_id <= 339999:
+                lookup_error = "Enter a NORAD ID between 1 and 339999."
+            elif (
+                entered_id not in st.session_state.globe_norad_ids
+                and len(st.session_state.globe_norad_ids) >= 8
+            ):
+                lookup_error = "Remove a satellite from the globe before adding another (maximum 8)."
+            else:
+                try:
+                    fetch_tles(entered_id)
+                except Exception as error:
+                    lookup_error = f"NORAD {entered_id} could not be loaded: {error}"
+                else:
+                    st.session_state.norad_id = entered_id
+                    if entered_id not in st.session_state.available_norad_ids:
+                        st.session_state.available_norad_ids.append(entered_id)
+                    if entered_id not in st.session_state.globe_norad_ids:
+                        st.session_state.globe_norad_ids.append(entered_id)
     if lookup_error:
         st.error(lookup_error)
 
@@ -608,8 +683,15 @@ with flyovers:
     if passes.empty:
         st.info(f"No complete passes above {min_elevation}° found in the next {horizon_hours} hours.")
     else:
+        try:
+            with st.spinner("Loading hourly weather for the selected location…"):
+                weather_forecast = fetch_hourly_weather(latitude, longitude)
+            passes = add_weather_to_passes(passes, weather_forecast)
+        except Exception as error:
+            st.warning(f"Weather forecast is unavailable: {error}")
+            passes = passes.drop(columns=["Peak datetime"])
         st.dataframe(passes, width="stretch", hide_index=True)
-    st.caption("Times are UTC. AOS/LOS are approximate crossings of the selected elevation mask.")
+    st.caption("Times are UTC. Weather is the nearest hourly forecast to each pass peak, not a guarantee of visibility.")
 
 with changes_tab:
     st.subheader("Orbital element updates")
@@ -623,6 +705,7 @@ with changes_tab:
 with sources:
     st.subheader("Data source")
     st.markdown("[CelesTrak General Perturbations (GP) data](https://celestrak.org/NORAD/elements/gp.php)")
+    st.markdown("Hourly weather forecasts by [Open-Meteo](https://open-meteo.com/), matched to each pass peak at the selected observer coordinates.")
     st.write("Enter a NORAD catalog number to retrieve its orbital elements. The lookup can include objects from any operator; a NORAD ID does not itself establish ownership or nationality.")
     st.subheader("What these numbers mean")
     st.write("General Perturbations (GP) element sets describe estimated orbits, not live spacecraft telemetry. Position, altitude, speed, ground tracks, and passes here are propagated estimates. This app does not establish intent or confirm a maneuver.")
